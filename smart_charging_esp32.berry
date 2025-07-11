@@ -1,0 +1,106 @@
+
+# Smart Charging Cut-Off Script for ESP32 (Tasmota + Berry)
+
+# === Configuration ===
+var start_threshold = 0.15         # Current (Ampere) threshold to detect start of charging
+var stop_drop_percent = 70         # Charging stops when current drops below this % of average
+var debounce_count = 3             # Number of consecutive low readings to confirm cut-off
+var buffer_size = 5                # Ring buffer size for averaging
+var button_gpio = 0                # GPIO number for manual start button (adjust as needed)
+
+# === Runtime Variables ===
+var current_buffer = []
+var buffer_index = 0
+var buffer_filled = 0
+var avg_baseline = 0.0
+var low_read_counter = 0
+var charging_active = false
+var manual_start = false
+
+# === Initialization ===
+var i = 0
+while i < buffer_size
+  current_buffer.push(0.0)
+  i += 1
+end
+
+# === Helper: Read Button State ===
+def button_pressed()
+  return gpio.read(button_gpio) == 0  # Assuming button pulls GPIO low when pressed
+end
+
+# === Helper: Average Current ===
+def average_current()
+  var sum = 0.0
+  var count = (buffer_filled < buffer_size) ? buffer_filled : buffer_size
+  var i = 0
+  while i < count
+    sum += current_buffer[i]
+    i += 1
+  end
+  return (count > 0) ? sum / count : 0.0
+end
+
+# === Charging Monitoring Function ===
+def monitor_charging()
+  var curr = energy.current
+  var pow = energy.active_power
+  var time_str = tasmota.strftime("%Y-%m-%d %H:%M:%S", tasmota.rtc()['local'])
+
+  # Store current reading in buffer
+  current_buffer[buffer_index] = curr
+  buffer_index = (buffer_index + 1) % buffer_size
+  if buffer_filled < buffer_size
+    buffer_filled += 1
+  end
+
+  # Manual activation check
+  if !manual_start
+    if button_pressed()
+      manual_start = true
+      print("[OK] Button pressed. Smart charging logic enabled.")
+    else
+      print("[WAIT] Waiting for button press to start charging logic.")
+      return
+    end
+  end
+
+  # Start charging logic when current exceeds threshold
+  if !charging_active and curr > start_threshold
+    charging_active = true
+    avg_baseline = 0.0
+    buffer_filled = 0
+    print("[START] Charging detected at current: " .. format("%.3f", curr) .. " A")
+    return
+  end
+
+  # While charging
+  if charging_active
+    var avg_curr = average_current()
+    if avg_baseline == 0.0 and buffer_filled == buffer_size
+      avg_baseline = avg_curr
+      print("[BASELINE] Set baseline avg current: " .. format("%.3f", avg_baseline) .. " A")
+    end
+
+    if avg_baseline > 0
+      var cutoff_value = avg_baseline * (stop_drop_percent / 100.0)
+      if avg_curr < cutoff_value
+        low_read_counter += 1
+        print(time_str .. ": Avg=" .. format("%.3f", avg_curr) .. " A < Cutoff=" .. format("%.3f", cutoff_value) .. " A [" .. low_read_counter .. "/" .. debounce_count .. "]")
+        if low_read_counter >= debounce_count
+          tasmota.set_power(0, false)
+          print("[CUTOFF] Charging complete. Power OFF.")
+          tasmota.remove_cron("monitor_charging")
+        end
+      else
+        low_read_counter = 0  # Reset if value recovers
+      end
+    end
+  end
+end
+
+# === Initial Check ===
+monitor_charging()
+
+# === Schedule: Every 60 Seconds ===
+tasmota.add_cron("0 * * * * *", monitor_charging, "monitor_charging")
